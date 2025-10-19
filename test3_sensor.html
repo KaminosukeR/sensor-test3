@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>スマホセンサー計測（粗表示版）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 10px; background: #f7f7f7; color: #111; }
+    header { text-align: center; margin-bottom: 8px; }
+    button { margin: 6px; padding: 8px 14px; font-size: 15px; }
+    .chart-wrap { max-width: 980px; margin: 8px auto; }
+    canvas { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    footer { text-align:center; margin-top:12px; font-size:13px; color:#555; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2>📱 スマホセンサー計測（0.1s集計・小数点2桁表示）</h2>
+    <p>データは raw に記録。グラフは 0.1 秒単位で平均化して表示します。</p>
+    <div>
+      <button id="startBtn">計測開始</button>
+      <button id="stopBtn" disabled>停止</button>
+      <button id="saveBtn" disabled>CSV 保存（表示値）</button>
+    </div>
+  </header>
+
+  <div class="chart-wrap">
+    <canvas id="accChart" height="160"></canvas>
+  </div>
+  <div class="chart-wrap">
+    <canvas id="rotChart" height="160"></canvas>
+  </div>
+
+  <footer>
+    表示は0.1秒単位に集計・小数点2桁に丸めています。CSVは表示値で保存されます（必要ならraw保存に切替可能）。
+  </footer>
+
+<script>
+/* ===== 設計 =====
+ - rawLog: 全センサーイベントをそのまま保存（永続CSV出力や後処理用）
+ - bucket aggregation: 100ms間隔で収集し平均をチャートへ追加
+ - display rounding: 小数点2桁で表示/保存
+ - MAX_POINTS: チャート内の最大点数（古いものを削除）
+*/
+
+const AGG_MS = 100;       // 0.1秒ごとに表示用に平均化
+const MAX_POINTS = 300;   // グラフに保持する点数（調整可）
+let rawLog = [];          // フル精度で保存
+let aggBuffer = [];       // 現在のバケットに入れて平均化するための一時配列
+let lastBucketTime = 0;
+let aggTimer = null;
+
+let accChart, rotChart;
+const accCtx = document.getElementById("accChart").getContext("2d");
+const rotCtx = document.getElementById("rotChart").getContext("2d");
+
+const accData = {
+  labels: [],
+  datasets: [
+    { label: 'Acc X (m/s²)', data: [], borderColor: 'rgba(220,53,69,1)', tension:0.2, pointRadius:0 },
+    { label: 'Acc Y (m/s²)', data: [], borderColor: 'rgba(25,135,84,1)', tension:0.2, pointRadius:0 },
+    { label: 'Acc Z (m/s²)', data: [], borderColor: 'rgba(13,110,253,1)', tension:0.2, pointRadius:0 }
+  ]
+};
+
+const rotData = {
+  labels: [],
+  datasets: [
+    { label: 'rot α (deg/s)', data: [], borderColor: 'rgba(102,16,242,1)', tension:0.2, pointRadius:0 },
+    { label: 'rot β (deg/s)', data: [], borderColor: 'rgba(255,159,67,1)', tension:0.2, pointRadius:0 },
+    { label: 'rot γ (deg/s)', data: [], borderColor: 'rgba(108,117,125,1)', tension:0.2, pointRadius:0 }
+  ]
+};
+
+accChart = new Chart(accCtx, {
+  type: 'line',
+  data: accData,
+  options: { animation:false, plugins:{legend:{position:'top'}}, scales:{ x:{display:true}, y:{display:true} } }
+});
+rotChart = new Chart(rotCtx, {
+  type: 'line',
+  data: rotData,
+  options: { animation:false, plugins:{legend:{position:'top'}}, scales:{ x:{display:true}, y:{display:true} } }
+});
+
+// ボタン
+const startBtn = document.getElementById("startBtn");
+const stopBtn  = document.getElementById("stopBtn");
+const saveBtn  = document.getElementById("saveBtn");
+
+startBtn.onclick = async () => {
+  // iOS等では権限が必要
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+    try {
+      const resp = await DeviceMotionEvent.requestPermission();
+      if (resp !== 'granted') { alert('センサー権限が必要です'); return; }
+    } catch(e){ alert('センサー権限の要求に失敗しました'); return; }
+  }
+  startRecording();
+};
+stopBtn.onclick = stopRecording;
+saveBtn.onclick = () => { saveCSV(false); }; // false => 表示値で保存（丸め）
+
+// 記録コントロール
+let recording = false;
+function startRecording(){
+  recording = true;
+  rawLog = [];
+  aggBuffer = [];
+  lastBucketTime = Math.floor(Date.now() / AGG_MS) * AGG_MS;
+  // チャートの初期化
+  accData.labels = []; accData.datasets.forEach(ds => ds.data = []);
+  rotData.labels = []; rotData.datasets.forEach(ds => ds.data = []);
+  accChart.update(); rotChart.update();
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  saveBtn.disabled = true;
+
+  window.addEventListener('devicemotion', onMotion, { passive: true });
+  // バケットフラッシュタイマー（保険）
+  aggTimer = setInterval(() => flushBucketIfNeeded(), AGG_MS + 20);
+}
+
+function stopRecording(){
+  recording = false;
+  window.removeEventListener('devicemotion', onMotion);
+  if (aggTimer) { clearInterval(aggTimer); aggTimer = null; }
+  // 最後のバケットをフラッシュ
+  flushBucket(true);
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  saveBtn.disabled = false;
+}
+
+// センサーイベント受け取り（高頻度） -> rawLog と aggBuffer に貯める
+function onMotion(e){
+  const t = Date.now();
+  const acc = e.accelerationIncludingGravity || e.acceleration || { x:0,y:0,z:0 };
+  const rot = e.rotationRate || { alpha:0,beta:0,gamma:0 };
+  const entry = {
+    t,
+    accX: acc.x || 0,
+    accY: acc.y || 0,
+    accZ: acc.z || 0,
+    rotA: rot.alpha || 0,
+    rotB: rot.beta || 0,
+    rotG: rot.gamma || 0
+  };
+  rawLog.push(entry);
+  // バケット判定
+  const bucketKey = Math.floor(t / AGG_MS) * AGG_MS;
+  if (bucketKey !== lastBucketTime) {
+    // バケット切替：古いバケットを吐く
+    flushBucket();
+    lastBucketTime = bucketKey;
+  }
+  aggBuffer.push(entry);
+}
+
+// バケット（0.1s）内のデータを平均化してチャートへ追加
+function flushBucket(force=false){
+  if (aggBuffer.length === 0 && !force) return;
+  if (aggBuffer.length === 0 && force) return;
+
+  // 平均を計算
+  const n = aggBuffer.length;
+  const sum = aggBuffer.reduce((s, d) => {
+    s.accX += d.accX; s.accY += d.accY; s.accZ += d.accZ;
+    s.rotA += d.rotA; s.rotB += d.rotB; s.rotG += d.rotG;
+    return s;
+  }, {accX:0,accY:0,accZ:0,rotA:0,rotB:0,rotG:0});
+
+  const avg = {
+    accX: sum.accX / n,
+    accY: sum.accY / n,
+    accZ: sum.accZ / n,
+    rotA: sum.rotA / n,
+    rotB: sum.rotB / n,
+    rotG: sum.rotG / n,
+    // label: 時刻（HH:MM:SS.s）
+    label: new Date(lastBucketTime).toLocaleTimeString() + '.' + String(Math.floor((lastBucketTime % 1000)/100))
+  };
+
+  // 表示用に小数点2桁に丸める
+  const round2 = v => Math.round(v * 100) / 100;
+
+  // ラベルとデータ追加（最新MAX_POINTSのみ保持）
+  accData.labels.push(avg.label);
+  accData.datasets[0].data.push(round2(avg.accX));
+  accData.datasets[1].data.push(round2(avg.accY));
+  accData.datasets[2].data.push(round2(avg.accZ));
+  rotData.labels.push(avg.label);
+  rotData.datasets[0].data.push(round2(avg.rotA));
+  rotData.datasets[1].data.push(round2(avg.rotB));
+  rotData.datasets[2].data.push(round2(avg.rotG));
+
+  // 古い点を削る
+  while (accData.labels.length > MAX_POINTS) {
+    accData.labels.shift();
+    accData.datasets.forEach(ds => ds.data.shift());
+    rotData.labels.shift();
+    rotData.datasets.forEach(ds => ds.data.shift());
+  }
+
+  // チャート更新（毎バケット更新しても負荷低）
+  accChart.update();
+  rotChart.update();
+
+  // バッファクリア
+  aggBuffer = [];
+}
+
+// 念のためのフラッシュ判定（タイマーから呼ぶ）
+function flushBucketIfNeeded(){
+  const nowKey = Math.floor(Date.now() / AGG_MS) * AGG_MS;
+  if (nowKey !== lastBucketTime) {
+    // 時間が進んでいれば今のバケットをフラッシュ
+    flushBucket();
+    lastBucketTime = nowKey;
+  }
+}
+
+// CSV 保存（表示値を保存）。raw=true にすると rawLog を保存できます。
+function saveCSV(raw=false){
+  let csv = [];
+  if (raw) {
+    csv.push('time(ms),accX,accY,accZ,rotA,rotB,rotG');
+    rawLog.forEach(d => {
+      csv.push(`${d.t},${d.accX},${d.accY},${d.accZ},${d.rotA},${d.rotB},${d.rotG}`);
+    });
+  } else {
+    // 表示中の丸められた点を保存（時刻ラベルは lastBucketTime label 表示）
+    csv.push('label,accX,accY,accZ,rotA,rotB,rotG');
+    for (let i=0;i<accData.labels.length;i++){
+      const label = accData.labels[i];
+      const ax = accData.datasets[0].data[i];
+      const ay = accData.datasets[1].data[i];
+      const az = accData.datasets[2].data[i];
+      const ra = rotData.datasets[0].data[i];
+      const rb = rotData.datasets[1].data[i];
+      const rg = rotData.datasets[2].data[i];
+      csv.push(`${label},${ax},${ay},${az},${ra},${rb},${rg}`);
+    }
+  }
+  const blob = new Blob([csv.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = raw ? 'sensor_raw.csv' : 'sensor_rounded.csv';
+  a.click();
+}
+
+</script>
+</body>
+</html>
