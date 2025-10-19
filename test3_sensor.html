@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>スマホセンサー計測（グラフ付き軽量版）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+      background: #f0f0f0;
+      margin: 0;
+      padding: 10px;
+    }
+    canvas {
+      background: white;
+      border-radius: 10px;
+      margin-top: 10px;
+    }
+    button {
+      margin: 8px;
+      padding: 10px 20px;
+      font-size: 16px;
+    }
+    #status {
+      background: white;
+      padding: 10px;
+      border-radius: 10px;
+      margin-top: 10px;
+      white-space: pre-line;
+    }
+  </style>
+</head>
+<body>
+  <h2>📱 スマホ加速度・角速度計測（軽量版）</h2>
+  <p>0.1秒ごとに加速度と回転を記録し、リアルタイムで表示します。</p>
+
+  <button id="startBtn">計測開始</button>
+  <button id="stopBtn" disabled>停止</button>
+  <button id="saveBtn" onclick="downloadCSV()" disabled>CSVをダウンロード</button>
+
+  <div id="status">まだ計測を開始していません。</div>
+
+  <canvas id="accChart" height="150"></canvas>
+  <canvas id="rotChart" height="150"></canvas>
+
+  <script>
+let dataLog = [];
+let startTime = null;
+let lastLogTime = 0;
+let measuring = false;
+
+// Chart.js 初期化
+const ctxAcc = document.getElementById('accChart').getContext('2d');
+const ctxRot = document.getElementById('rotChart').getContext('2d');
+
+const accData = {
+  labels: [],
+  datasets: [
+    { label: 'X', data: [], borderColor: 'red', fill: false },
+    { label: 'Y', data: [], borderColor: 'green', fill: false },
+    { label: 'Z', data: [], borderColor: 'blue', fill: false }
+  ]
+};
+const rotData = {
+  labels: [],
+  datasets: [
+    { label: 'A', data: [], borderColor: 'orange', fill: false },
+    { label: 'B', data: [], borderColor: 'purple', fill: false },
+    { label: 'C', data: [], borderColor: 'brown', fill: false }
+  ]
+};
+
+const accChart = new Chart(ctxAcc, {
+  type: 'line',
+  data: accData,
+  options: {
+    animation: false,
+    responsive: true,
+    scales: { y: { beginAtZero: true } }
+  }
+});
+const rotChart = new Chart(ctxRot, {
+  type: 'line',
+  data: rotData,
+  options: {
+    animation: false,
+    responsive: true,
+    scales: { y: { beginAtZero: true } }
+  }
+});
+
+// 計測開始
+document.getElementById("startBtn").onclick = () => {
+  dataLog = [];
+  accData.labels = [];
+  accData.datasets.forEach(ds => ds.data = []);
+  rotData.labels = [];
+  rotData.datasets.forEach(ds => ds.data = []);
+  startTime = null;
+  lastLogTime = 0;
+  measuring = true;
+  document.getElementById("startBtn").disabled = true;
+  document.getElementById("stopBtn").disabled = false;
+  document.getElementById("saveBtn").disabled = true;
+  document.getElementById("status").innerText = "計測中...";
+};
+
+// 計測停止
+document.getElementById("stopBtn").onclick = () => {
+  measuring = false;
+  document.getElementById("startBtn").disabled = false;
+  document.getElementById("stopBtn").disabled = true;
+  document.getElementById("saveBtn").disabled = false;
+};
+
+// データ記録（0.1秒ごと）
+window.addEventListener('devicemotion', (event) => {
+  if (!measuring) return;
+  const now = Date.now();
+  if (!startTime) startTime = now;
+
+  if (now - lastLogTime >= 100) { // 0.1秒間隔
+    lastLogTime = now;
+
+    const t = ((now - startTime) / 1000).toFixed(1);
+    const acc = event.accelerationIncludingGravity || {};
+    const rot = event.rotationRate || {};
+
+    const ax = Number((acc.x ?? 0).toFixed(2));
+    const ay = Number((acc.y ?? 0).toFixed(2));
+    const az = Number((acc.z ?? 0).toFixed(2));
+    const a = Number((rot.alpha ?? 0).toFixed(2));
+    const b = Number((rot.beta ?? 0).toFixed(2));
+    const c = Number((rot.gamma ?? 0).toFixed(2));
+
+    dataLog.push({ t, ax, ay, az, a, b, c });
+
+    // 最新データを表示
+    document.getElementById('status').innerText =
+      `経過時間: ${t}s\n` +
+      `加速度 [X:${ax}, Y:${ay}, Z:${az}]\n` +
+      `回転 [A:${a}, B:${b}, C:${c}]`;
+
+    // グラフ更新
+    accData.labels.push(t);
+    rotData.labels.push(t);
+    accData.datasets[0].data.push(ax);
+    accData.datasets[1].data.push(ay);
+    accData.datasets[2].data.push(az);
+    rotData.datasets[0].data.push(a);
+    rotData.datasets[1].data.push(b);
+    rotData.datasets[2].data.push(c);
+
+    const MAX_POINTS = 100;
+    if (accData.labels.length > MAX_POINTS) {
+      accData.labels.shift();
+      rotData.labels.shift();
+      accData.datasets.forEach(ds => ds.data.shift());
+      rotData.datasets.forEach(ds => ds.data.shift());
+    }
+
+    accChart.update();
+    rotChart.update();
+  }
+});
+
+// CSVダウンロード
+function downloadCSV() {
+  let csv = "time,accX,accY,accZ,rotA,rotB,rotC\n";
+  dataLog.forEach(d => {
+    csv += `${d.t},${d.ax},${d.ay},${d.az},${d.a},${d.b},${d.c}\n`;
+  });
+
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = "sensor_data.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+  </script>
+</body>
+</html>
